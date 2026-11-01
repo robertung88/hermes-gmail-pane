@@ -728,13 +728,51 @@ def _current_home() -> str:
     return str(Path(get_hermes_home()).expanduser().resolve(strict=False))
 
 
+def _token_paths() -> list[Path]:
+    """Where a Google grant may live, most specific first.
+
+    The profile's own token wins, so a profile can deliberately point at another
+    account. The shared desktop store is the fallback: these panes are desktop
+    surfaces shared by every profile (the app loads one UI half for all of them),
+    so "this profile was never granted a token" must not mean "no mail here".
+    """
+    candidates = [Path(_current_home()) / "google_token.json"]
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = Path(get_default_hermes_root(home=_current_home()))
+    except Exception:
+        root = Path.home() / ".hermes"
+    shared = root / "desktop-google" / "google_token.json"
+    if shared not in candidates:
+        candidates.append(shared)
+    return candidates
+
+
+def _resolved_token() -> tuple[Path, str] | None:
+    """(path, source) for the grant this call should use, or None."""
+    for index, path in enumerate(_token_paths()):
+        try:
+            if path.is_file():
+                return path, ("profile" if index == 0 else "shared")
+        except OSError:
+            continue
+    return None
+
+
+def _credential_source() -> str:
+    resolved = _resolved_token()
+    return resolved[1] if resolved else "missing"
+
+
 def _load_credentials() -> Any:
-    """Resolve and load credentials for the call's active profile only."""
+    """Load the profile's grant, or the shared desktop grant when it has none."""
     from google.oauth2.credentials import Credentials
 
-    token_path = Path(_current_home()) / "google_token.json"
-    if not token_path.is_file():
+    resolved = _resolved_token()
+    if resolved is None:
         raise _AuthUnavailable("missing credentials")
+    token_path, _source = resolved
     # Deliberately omit scopes: preserve exactly the grants stored by setup.
     credentials = Credentials.from_authorized_user_file(str(token_path))
     if credentials.expired and credentials.refresh_token:
@@ -801,8 +839,11 @@ _provider_local = threading.local()
 
 
 def _token_stamp() -> str:
+    resolved = _resolved_token()
+    if resolved is None:
+        return ""
     try:
-        return str(int((Path(_current_home()) / "google_token.json").stat().st_mtime))
+        return f"{resolved[0]}:{int(resolved[0].stat().st_mtime)}"
     except OSError:
         return ""
 
@@ -828,7 +869,9 @@ def _clear_provider_cache(home: str) -> None:
         store.pop(home, None)
 
 
-def _provider_context(binding: ScopeBinding | None = None) -> tuple[Any, str, str]:
+def _provider_context(
+    binding: ScopeBinding | None = None, scope: str | None = None
+) -> tuple[Any, str, str]:
     home = _current_home()
     stamp = _token_stamp()
     account = None
@@ -850,7 +893,16 @@ def _provider_context(binding: ScopeBinding | None = None) -> tuple[Any, str, st
     except Exception:
         _clear_provider_cache(home)
         raise _provider_error() from None
-    if binding and (binding.backend != _BACKEND_INSTANCE or binding.home != home or binding.account != account):
+    if binding is None and scope:
+        # The token is from a previous process; adopt it for the account this
+        # profile really resolves to, so an open pane keeps working across a
+        # backend restart instead of 409-ing until the user clicks Retry.
+        binding = ScopeBinding(_BACKEND_INSTANCE, home, account, _now())
+        with _lock:
+            _scopes[scope] = binding
+            while len(_scopes) > _MAX_SCOPES:
+                _scopes.popitem(last=False)
+    if binding and (binding.home != home or binding.account != account):
         raise HTTPException(status_code=409, detail="Gmail connection changed; refresh status.")
     return service, account, home
 
@@ -862,7 +914,16 @@ def _reject_query_extras(request: Request, allowed: set[str]) -> None:
         raise HTTPException(status_code=422, detail="Unexpected query parameter.")
 
 
-def _binding(scope: str) -> ScopeBinding:
+def _binding(scope: str, *, allow_rebind: bool = False) -> ScopeBinding | None:
+    """Resolve a scope token.
+
+    An UNKNOWN token means this process never minted it — the plugin host child
+    was recycled, or another profile's backend answered. That is not an account
+    change, so a read call may adopt the token (``allow_rebind``) and carry on;
+    the account is then resolved from the credential and compared, which still
+    catches a real A->B switch. Without ``allow_rebind`` (mutations, whose ticket
+    also died with the process) the caller gets the 409 and re-prepares.
+    """
     if not _TOKEN_RE.fullmatch(scope):
         raise HTTPException(status_code=422, detail="Invalid scope.")
     home = _current_home()
@@ -870,7 +931,11 @@ def _binding(scope: str) -> ScopeBinding:
         binding = _scopes.get(scope)
         if binding:
             _scopes.move_to_end(scope)
-    if not binding or binding.backend != _BACKEND_INSTANCE or binding.home != home:
+    if binding is None:
+        if not allow_rebind:
+            raise HTTPException(status_code=409, detail="Gmail connection changed; refresh status.")
+        return None
+    if binding.home != home:
         raise HTTPException(status_code=409, detail="Gmail connection changed; refresh status.")
     return binding
 
@@ -1254,7 +1319,7 @@ def status(request: Request) -> dict[str, str]:
         scope = next((key for key, value in _scopes.items() if value.home == home and value.account == account), None)
         if scope is None:
             scope = _new_scope(home, account)
-    return {"scope": scope, "account": account}
+    return {"scope": scope, "account": account, "credential": _credential_source()}
 
 
 @router.get("/search")
@@ -1266,8 +1331,8 @@ def search(
     pageToken: Annotated[str, Query(max_length=2048)] = "",
 ) -> dict[str, Any]:
     _reject_query_extras(request, {"scope", "q", "maxResults", "pageToken"})
-    binding = _binding(scope)
-    service, _, _ = _provider_context(binding)
+    binding = _binding(scope, allow_rebind=True)
+    service, _, _ = _provider_context(binding, scope)
     try:
         params: dict[str, Any] = {"userId": "me", "q": q, "maxResults": maxResults}
         if pageToken:
@@ -1304,8 +1369,8 @@ def search(
 @router.get("/messages/{message_id}")
 def message_detail(request: Request, message_id: MessageId, scope: ScopeText) -> dict[str, Any]:
     _reject_query_extras(request, {"scope"})
-    binding = _binding(scope)
-    service, _, _ = _provider_context(binding)
+    binding = _binding(scope, allow_rebind=True)
+    service, _, _ = _provider_context(binding, scope)
     try:
         _, message = _get_message(service, message_id, full=True)
         return message
@@ -1317,8 +1382,8 @@ def message_detail(request: Request, message_id: MessageId, scope: ScopeText) ->
 def read_message_on_open(request: Request, message_id: MessageId, scope: ScopeText) -> dict[str, Any]:
     """Mark only this opened message as read and verify the exact resulting labels."""
     _reject_query_extras(request, {"scope"})
-    binding = _binding(scope)
-    service, _, _ = _provider_context(binding)
+    binding = _binding(scope, allow_rebind=True)
+    service, _, _ = _provider_context(binding, scope)
     with _READ_ON_OPEN_LOCK:
         try:
             _, current = _get_message(service, message_id)
@@ -1344,8 +1409,8 @@ def read_message_on_open(request: Request, message_id: MessageId, scope: ScopeTe
 @router.get("/threads/{thread_id}")
 def thread_detail(request: Request, thread_id: MessageId, scope: ScopeText) -> dict[str, Any]:
     _reject_query_extras(request, {"scope"})
-    binding = _binding(scope)
-    service, _, _ = _provider_context(binding)
+    binding = _binding(scope, allow_rebind=True)
+    service, _, _ = _provider_context(binding, scope)
     try:
         raw, items = _get_thread(service, thread_id)
         return {
@@ -1360,8 +1425,8 @@ def thread_detail(request: Request, thread_id: MessageId, scope: ScopeText) -> d
 @router.get("/labels")
 def labels(request: Request, scope: ScopeText) -> dict[str, Any]:
     _reject_query_extras(request, {"scope"})
-    binding = _binding(scope)
-    service, _, _ = _provider_context(binding)
+    binding = _binding(scope, allow_rebind=True)
+    service, _, _ = _provider_context(binding, scope)
     try:
         return {"labels": _list_user_labels(service)}
     except Exception:
@@ -1376,8 +1441,8 @@ def attachment_content(request: Request, message_id: MessageId, attachment_id: M
                       scope: ScopeText) -> dict[str, Any]:
     """Read-only single-attachment fetch, bounded, profile/account-scoped."""
     _reject_query_extras(request, {"scope"})
-    binding = _binding(scope)
-    service, _, _ = _provider_context(binding)
+    binding = _binding(scope, allow_rebind=True)
+    service, _, _ = _provider_context(binding, scope)
     try:
         # attachmentId is Gmail's opaque [A-Za-z0-9_-]+ token, same shape as
         # MessageId; identity checks mirror _get_message.
