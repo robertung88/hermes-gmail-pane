@@ -1,0 +1,15 @@
+name: hermes-gmail-pane
+version: 1.1.0
+description: >
+  Gmail as both a full page and a dockable pane in Hermes Desktop, forked from
+  guberm's hermes-gmail-desktop-plugin 1.0.20 and maintained here. Telegram-style
+  conversation rows, a reading view with attachments and label chips, reviewed
+  mailbox actions (prepare, confirm, commit, readback), new-mail alerts, and an
+  Ask-agent handoff that opens a fresh chat in a chosen Hermes profile. The
+  Python half reads the active profile's own google_token.json over ctx.rest, so
+  no token is ever baked into the source.
+manifest_version: 1
+kind: standalone
+author: Robert Ung (fork of Michael Guber's Gmail pane)
+license: Private
+homepage: https://github.com/robertung88/hermes-gmail-pane
